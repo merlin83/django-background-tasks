@@ -1,4 +1,5 @@
 from django.core.management.base import BaseCommand
+from django.db import close_connection
 import time
 from optparse import make_option
 import logging
@@ -79,5 +80,6 @@ class Command(BaseCommand):
         
         while (duration <= 0) or (time.time() - start_time) <= duration:
             if not tasks.run_next_task():
+                close_connection()
                 logging.debug('waiting for tasks')
                 time.sleep(sleep)
