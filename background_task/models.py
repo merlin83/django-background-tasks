@@ -35,7 +35,7 @@ class TaskManager(models.Manager):
 
     def unlocked(self, now):
         max_run_time = getattr(settings, 'MAX_RUN_TIME', 3600)
-        qs = self.get_query_set()
+        qs = self.get_queryset()
         expires_at = now - timedelta(seconds=max_run_time)
         unlocked = Q(locked_by=None) | Q(locked_at__lt=expires_at)
         return qs.filter(unlocked)
@@ -61,7 +61,7 @@ class TaskManager(models.Manager):
         kwargs = kwargs or {}
         task_params = json.dumps((args, kwargs))
         task_hash = sha1(task_name + task_params).hexdigest()
-        qs = self.get_query_set()
+        qs = self.get_queryset()
         return qs.filter(task_hash=task_hash)
 
     def drop_task(self, task_name, args=None, kwargs=None):
