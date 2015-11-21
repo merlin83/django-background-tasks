@@ -3,6 +3,7 @@ from django.db.models import Q
 from django.conf import settings
 from django.utils.encoding import python_2_unicode_compatible
 import django
+import inspect
 
 
 from django.utils import timezone
@@ -11,22 +12,58 @@ from datetime import datetime, timedelta
 from hashlib import sha1
 import traceback
 import logging
-
 from compat import StringIO
-
-from .models_completed import CompletedTask
-
-
 import json
 
+from background_task.models_completed import CompletedTask
+from background_task.signals import task_failed, task_rescheduled
 
-
+ 
 
 # inspired by http://github.com/tobi/delayed_job
+# 
 
+# Django 1.6 renamed Manager's get_query_set to get_queryset, and the old
+# function will be removed entirely in 1.8. We work back to 1.4, so use a
+# metaclass to not worry about it.
+# from https://github.com/mysociety/mapit/blob/master/mapit/djangopatch.py#L14-L42
 
-class TaskManager(models.Manager):
+try:
+    from django.utils import six
+except ImportError:  # Django < 1.4.2
+    import six 
+    
+    
+if django.get_version() < '1.6':
+    class GetQuerySetMetaclass(type):
+        def __new__(cls, name, bases, attrs):
+            new_class = super(GetQuerySetMetaclass, cls).__new__(cls, name, bases, attrs)
 
+            old_method_name = 'get_query_set'
+            new_method_name = 'get_queryset'
+            for base in inspect.getmro(new_class):
+                old_method = base.__dict__.get(old_method_name)
+                new_method = base.__dict__.get(new_method_name)
+
+                if not new_method and old_method:
+                    setattr(base, new_method_name, old_method)
+                if not old_method and new_method:
+                    setattr(base, old_method_name, new_method)
+
+            return new_class
+elif django.get_version() < '1.8':
+    # Nothing to do, make an empty metaclass
+    from django.db.models.manager import RenameManagerMethods
+
+    class GetQuerySetMetaclass(RenameManagerMethods):
+        pass
+else:
+    class GetQuerySetMetaclass(type):
+        pass
+        
+        
+class TaskManager(six.with_metaclass(GetQuerySetMetaclass, models.Manager)):
+    
     def find_available(self):
         now = timezone.now()
         qs = self.unlocked(now)
@@ -35,7 +72,7 @@ class TaskManager(models.Manager):
 
     def unlocked(self, now):
         max_run_time = getattr(settings, 'MAX_RUN_TIME', 3600)
-        qs = self.get_query_set()
+        qs = self.get_queryset()
         expires_at = now - timedelta(seconds=max_run_time)
         unlocked = Q(locked_by=None) | Q(locked_at__lt=expires_at)
         return qs.filter(unlocked)
@@ -48,8 +85,8 @@ class TaskManager(models.Manager):
             run_at = timezone.now()
 
         task_params = json.dumps((args, kwargs))
-        task_hash = sha1((task_name + task_params).encode()).hexdigest()
-
+        s = "%s%s" % (task_name, task_params)
+        task_hash = sha1(s.encode('utf-8')).hexdigest()
         return Task(task_name=task_name,
                     task_params=task_params,
                     task_hash=task_hash,
@@ -60,8 +97,9 @@ class TaskManager(models.Manager):
         args = args or ()
         kwargs = kwargs or {}
         task_params = json.dumps((args, kwargs))
-        task_hash = sha1(task_name + task_params).hexdigest()
-        qs = self.get_query_set()
+        s = "%s%s" % (task_name, task_params)
+        task_hash = sha1(s.encode('utf-8')).hexdigest()
+        qs = self.get_queryset()
         return qs.filter(task_hash=task_hash)
 
     def drop_task(self, task_name, args=None, kwargs=None):
@@ -114,25 +152,55 @@ class Task(models.Model):
         traceback.print_exception(type, err, tb, None, file)
         return file.getvalue()
 
-    def reschedule(self, type, err, traceback):
-        self.last_error = self._extract_error(type, err, traceback)
-        max_attempts = getattr(settings, 'MAX_ATTEMPTS', 25)
+    def increment_attempts(self):
+        self.attempts += 1
+        self.save()
 
-        if self.attempts >= max_attempts:
+    def has_reached_max_attempts(self):
+        max_attempts = getattr(settings, 'MAX_ATTEMPTS', 25)
+        return self.attempts >= max_attempts
+
+    def reschedule(self, type, err, traceback):
+        '''
+        Set a new time to run the task in future, or create a CompletedTask and delete the Task
+        if it has reached the maximum of allowed attempts
+        '''
+        self.last_error = self._extract_error(type, err, traceback)
+        self.increment_attempts()
+        if self.has_reached_max_attempts():
             self.failed_at = timezone.now()
             logging.warn('Marking task %s as failed', self)
+            completed = self.create_completed_task()
+            task_failed.send(sender=self.__class__, task_id=self.id, completed_task=completed)
+            self.delete()
         else:
-            self.attempts += 1
             backoff = timedelta(seconds=(self.attempts ** 4) + 5)
             self.run_at = timezone.now() + backoff
             logging.warn('Rescheduling task %s for %s later at %s', self,
                 backoff, self.run_at)
+            task_rescheduled.send(sender=self.__class__, task=self)
+            self.locked_by = None
+            self.locked_at = None
+            self.save()
 
-        # and unlock
-        self.locked_by = None
-        self.locked_at = None
-
-        self.save()
+    def create_completed_task(self):
+        '''
+        Returns a new CompletedTask instance with the same values
+        '''
+        completed_task = CompletedTask(
+            task_name=self.task_name,
+            task_params=self.task_params,
+            task_hash=self.task_hash,
+            priority=self.priority,
+            run_at=timezone.now(),
+            attempts=self.attempts,
+            failed_at=self.failed_at,
+            last_error=self.last_error,
+            locked_by=self.locked_by,
+            locked_at=self.locked_at
+        )
+        completed_task.save()
+        return completed_task
 
     def save(self, *arg, **kw):
         # force NULL rather than empty string

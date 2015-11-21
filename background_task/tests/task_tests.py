@@ -10,7 +10,7 @@ if sys.version_info >= (3, 0):
     unicode = str
 
 from background_task.tasks import tasks, TaskSchedule, TaskProxy
-from background_task.models import Task 
+from background_task.models import Task, CompletedTask
 from background_task import background
 
 _recorded = []
@@ -257,7 +257,7 @@ class TestTaskRunner(TransactionTestCase):
         self.runner = tasks._runner
 
     def test_get_task_to_run_no_tasks(self):
-        self.failIf(self.runner.get_task_to_run())
+        self.failIf(self.runner.get_task_to_run(tasks))
 
     def test_get_task_to_run(self):
         task = Task.objects.new_task('mytask', (1), {})
@@ -265,7 +265,7 @@ class TestTaskRunner(TransactionTestCase):
         self.failUnless(task.locked_by is None)
         self.failUnless(task.locked_at is None)
 
-        locked_task = self.runner.get_task_to_run()
+        locked_task = self.runner.get_task_to_run(tasks)
         self.failIf(locked_task is None)
         self.failIf(locked_task.locked_by is None)
         self.assertEqual(self.runner.worker_name, locked_task.locked_by)
@@ -497,7 +497,47 @@ class TestTasks(TransactionTestCase):
         self.assertEqual(0, available.count())
 
         all_tasks = Task.objects.all()
-        self.assertEqual(1, all_tasks.count())
-        task = all_tasks[0]
+        self.assertEqual(0, all_tasks.count())
+        self.assertEqual(1, CompletedTask.objects.count())
+        completed_task = CompletedTask.objects.all()[0]
+        self.failIf(completed_task.failed_at is None)
 
-        self.failIf(task.failed_at is None)
+
+class MaxAttemptsTestCase(TransactionTestCase):
+
+    def setUp(self):
+        @tasks.background(name='failing task')
+        def failing_task():
+            return 0/0
+        self.failing_task = failing_task
+        self.task1 = self.failing_task()
+        self.task2 = self.failing_task()
+        self.task1_id = self.task1.id
+        self.task2_id = self.task2.id
+
+    def test_max_attempts_one(self):
+        with self.settings(MAX_ATTEMPTS=1):
+            self.assertEqual(settings.MAX_ATTEMPTS, 1)
+            self.assertEqual(Task.objects.count(), 2)
+
+            tasks.run_next_task()
+            self.assertEqual(Task.objects.count(), 1)
+            self.assertEqual(Task.objects.all()[0].id, self.task2_id)
+            self.assertEqual(CompletedTask.objects.count(), 1)
+            completed_task = CompletedTask.objects.all()[0]
+            self.assertEqual(completed_task.attempts, 1)
+            self.assertEqual(completed_task.task_name, self.task1.task_name)
+            self.assertEqual(completed_task.task_params, self.task1.task_params)
+            self.assertIsNotNone(completed_task.last_error)
+            self.assertIsNotNone(completed_task.failed_at)
+
+            tasks.run_next_task()
+            self.assertEqual(Task.objects.count(), 0)
+            self.assertEqual(CompletedTask.objects.count(), 2)
+
+    def test_max_attempts_two(self):
+        with self.settings(MAX_ATTEMPTS=2):
+            self.assertEqual(settings.MAX_ATTEMPTS, 2)
+            tasks.run_next_task()
+            self.assertEqual(Task.objects.count(), 2)
+            self.assertEqual(CompletedTask.objects.count(), 0)

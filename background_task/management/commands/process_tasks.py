@@ -9,7 +9,7 @@ from background_task.tasks import tasks, autodiscover
 
 class Command(BaseCommand):
     LOG_LEVELS = ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG']
-    
+
     help = 'Run tasks that are scheduled to run on the queue'
     option_list = BaseCommand.option_list + (
             make_option('--duration',
@@ -31,7 +31,7 @@ class Command(BaseCommand):
             make_option('--log-std',
                 action='store_true',
                 dest='log_std',
-                help='Redirect stdout and stderr to the logging system'),            
+                help='Redirect stdout and stderr to the logging system'),
             make_option('--log-level',
                 action='store',
                 type='choice',
@@ -39,18 +39,23 @@ class Command(BaseCommand):
                 dest='log_level',
                 help='Set logging level (%s)' % ', '.join(LOG_LEVELS)),
             )
-    
+
+    def __init__(self, *args, **kwargs):
+        super(Command, self).__init__(*args, **kwargs)
+        self._tasks = tasks
+
+
     def _configure_logging(self, log_level, log_file, log_std):
 
         if log_level:
             log_level = getattr(logging, log_level)
-        
+
         config = {}
         if log_level:
             config['level'] = log_level
         if log_file:
             config['filename'] = log_file
-        
+
         if config:
             logging.basicConfig(**config)
 
@@ -64,22 +69,22 @@ class Command(BaseCommand):
             sys.stdout = StdOutWrapper()
             sys.stderr = StdErrWrapper()
 
-    
+
     def handle(self, *args, **options):
         log_level = options.pop('log_level', None)
         log_file = options.pop('log_file', None)
         log_std = options.pop('log_std', False)
         duration = options.pop('duration', 0)
         sleep = options.pop('sleep', 5.0)
-        
+
         self._configure_logging(log_level, log_file, log_std)
-        
+
         autodiscover()
-        
+
         start_time = time.time()
-        
+
         while (duration <= 0) or (time.time() - start_time) <= duration:
-            if not tasks.run_next_task():
+            if not self._tasks.run_next_task():
                 close_connection()
                 logging.debug('waiting for tasks')
                 time.sleep(sleep)

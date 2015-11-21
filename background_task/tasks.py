@@ -1,27 +1,69 @@
 from __future__ import unicode_literals
+
 from django.utils.encoding import python_2_unicode_compatible
-
-
+from django.db import transaction
+from django.utils import timezone
+from django.conf import settings
 import django
+
 import os
 import logging
 import sys
 from datetime import datetime, timedelta
-from django.db import transaction
-from django.utils import timezone
+
 from compat import atomic
-# monkey patch django: get_query_set + import_module
 from compat import import_module
 
-from .models import Task, CompletedTask
+from background_task.exceptions import BackgroundTaskError
+from background_task.models import Task
+from background_task.models import CompletedTask
+from background_task.signals import task_created, task_error, task_successful
 
+import threading
+
+logger = logging.getLogger(__name__)
+
+
+BACKGROUND_TASK_RUN_ASYNC = getattr(settings, 'BACKGROUND_TASK_RUN_ASYNC', False)
  
-
-
+   
+def bg_runner(proxy_task, *args, **kwargs):
+    """ Executes the function attached to task. Used to enable threads. """
+    task = None
+    try: 
+        func = getattr(proxy_task, 'task_function', None)
+        task_name = getattr(proxy_task, 'name', None)
+        
+        task_qs = Task.objects.get_task(task_name=task_name, args=args, kwargs=kwargs)
+        if task_qs:
+            task = task_qs[0]
+        if func is None:
+            raise BackgroundTaskError("Function is None, can't execute!")
+        func(*args, **kwargs)
+        
+        if task:
+            # task done, so can delete it
+            task.increment_attempts()
+            completed = task.create_completed_task()
+            task_successful.send(sender=task.__class__, task_id=task.id, completed_task=completed)
+            task.delete()
+            logging.info('Ran task and deleting %s', task)
+        
+    except Exception as ex:
+        t, e, traceback = sys.exc_info()
+        if task:
+            logging.warn('Rescheduling %s', task, exc_info=(t, e, traceback))
+            task_error.send(sender=ex.__class__, task=task)
+            task.reschedule(t, e, traceback)
+        del traceback
+        
+        
 class Tasks(object):
     def __init__(self):
         self._tasks = {}
         self._runner = DBTaskRunner()
+        self._task_proxy_class = TaskProxy
+        self._bg_runner = bg_runner
 
     def background(self, name=None, schedule=None):
         '''
@@ -41,19 +83,21 @@ class Tasks(object):
             _name = name
             if not _name:
                 _name = '%s.%s' % (fn.__module__, fn.__name__)
-            proxy = TaskProxy(_name, fn, schedule, self._runner)
+            proxy = self._task_proxy_class(_name, fn, schedule, self._runner)
             self._tasks[_name] = proxy
             return proxy
-
         if fn:
             return _decorator(fn)
 
         return _decorator
 
     def run_task(self, task_name, args, kwargs):
-        task = self._tasks[task_name]
-        task.task_function(*args, **kwargs)
-
+        proxy_task = self._tasks[task_name]
+        if BACKGROUND_TASK_RUN_ASYNC:
+            curr_thread = threading.Thread(target=self._bg_runner, args=(proxy_task,) + tuple(args), kwargs=kwargs)
+            curr_thread.start()
+        else:
+            self._bg_runner(proxy_task, *args, **kwargs)
     def run_next_task(self):
         return self._runner.run_next_task(self)
 
@@ -152,12 +196,14 @@ class DBTaskRunner(object):
                     return
 
         task.save()
-
-    # @transaction.autocommit
+        task_created.send(sender=self.__class__, task=task)
+        return task
+ 
     @atomic
-    def get_task_to_run(self):
-        tasks = Task.objects.find_available()[:5]
-        for task in tasks:
+    def get_task_to_run(self, tasks):
+        available_tasks = [task for task in Task.objects.find_available()
+                           if task.task_name in tasks._tasks][:5]
+        for task in available_tasks:
             # try to lock task
             locked_task = task.lock(self.worker_name)
             if locked_task:
@@ -165,37 +211,18 @@ class DBTaskRunner(object):
         return None
 
 
-    # @transaction.autocommit
     @atomic
     def run_task(self, tasks, task):
-        try:
-            logging.info('Running %s', task)
-            args, kwargs = task.params()
-            tasks.run_task(task.task_name, args, kwargs)
-            # task done, so can delete it
-            completed = CompletedTask(task_name=task.task_name,
-                                      task_params=task.task_params,
-                                      task_hash=task.task_hash,
-                                      priority=task.priority,
-                                      run_at=timezone.now(),
-                                      attempts=task.attempts,
-                                      failed_at=task.failed_at,
-                                      last_error=task.last_error,
-                                      locked_by=task.locked_by,
-                                      locked_at=task.locked_at)
-            completed.save()
-            task.delete()
-            logging.info('Ran task and deleting %s', task)
-        except Exception:
-            t, e, traceback = sys.exc_info()
-            logging.warn('Rescheduling %s', task, exc_info=(t, e, traceback))
-            task.reschedule(t, e, traceback)
-            del traceback
+        logging.info('Running %s', task)
+        args, kwargs = task.params()
+        tasks.run_task(task.task_name, args, kwargs)
+
+
     @atomic
     def run_next_task(self, tasks):
         # we need to commit to make sure
         # we can see new tasks as they arrive
-        task = self.get_task_to_run()
+        task = self.get_task_to_run(tasks)
         #transaction.commit()
         if task:
             self.run_task(tasks, task)
@@ -218,7 +245,7 @@ class TaskProxy(object):
         run_at = schedule.run_at
         priority = schedule.priority
         action = schedule.action
-        self.runner.schedule(self.name, args, kwargs, run_at, priority, action)
+        return self.runner.schedule(self.name, args, kwargs, run_at, priority, action)
 
     def __str__(self):
         return 'TaskProxy(%s)' % self.name

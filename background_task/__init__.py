@@ -1,6 +1,6 @@
-__version__ = '1.0.3'
+__version__ = '1.0.10'
 
 
 def background(*arg, **kw):
-    from .tasks import tasks
+    from background_task.tasks import tasks
     return tasks.background(*arg, **kw)
